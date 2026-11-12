@@ -13,6 +13,8 @@ The RSRC Class is also from refinery.
 from pathlib import Path
 import re
 from typing import Tuple, Optional, Any, Callable, List
+import os
+from dataclasses import dataclass, field
 import pefile
 import binascii
 import zlib
@@ -21,6 +23,7 @@ from typing import Generator, Iterable, Optional
 
 import debloat.utilities.nsisParser as nsisParser
 import debloat.utilities.rsrc as rsrc
+from debloat.verifier import VerificationIssue, verify_output, has_errors
 
 DEBLOAT_VERSION = "1.7.1"
 
@@ -46,6 +49,20 @@ RESULT_CODES = {
     18: "SFX Archive",
     19: "Electron Application"
 }
+
+
+@dataclass
+class ProcessResult:
+    '''Outcome of a process_pe run.'''
+    result_code: int
+    tactic: str
+    original_size: int
+    output_size: int
+    removed_bytes: int
+    removed_ranges: List[Tuple[int, int]]
+    written: bool
+    ok: bool
+    verification: List[VerificationIssue] = field(default_factory=list)
 
 
 _KB = 1000
@@ -508,11 +525,30 @@ def trim_junk(pe: pefile.PE, bloated_content: memoryview,
 
 def process_pe(pe: pefile.PE, out_path: str, last_ditch_processing: bool,
                 cert_preservation: bool,log_message: Callable[[str], None], 
-                beginning_file_size: int = 0, extract: bool = True) -> int:
-    '''Prepare PE, perform checks, remote junk, write patched binary.'''
+                beginning_file_size: int = 0, extract: bool = True,
+                write_output: bool = True) -> ProcessResult:
+    '''Prepare PE, perform checks, remote junk, write patched binary.
+
+    When write_output is False the file is only analyzed: no output is
+    written and no verification is performed.'''
     result_code = 0
     if not beginning_file_size:
         beginning_file_size = len(pe.write())
+    original_data = bytes(pe.__data__)
+
+    def make_result(result_code: int, output_size: int, removed_bytes: int,
+                    removed_ranges: List, written: bool, ok: bool,
+                    verification: List = None) -> ProcessResult:
+        return ProcessResult(
+            result_code=result_code,
+            tactic=RESULT_CODES[result_code],
+            original_size=beginning_file_size,
+            output_size=output_size,
+            removed_bytes=removed_bytes,
+            removed_ranges=removed_ranges,
+            written=written,
+            ok=ok,
+            verification=verification if verification is not None else [])
 
     # Remove Signature and modify size of Optional Header Security entry.
     signature_address, signature_size = get_signature_info(pe, cert_preservation)
@@ -539,15 +575,20 @@ def process_pe(pe: pefile.PE, out_path: str, last_ditch_processing: bool,
         if extract:
             nsis_extracted = check_and_extract_NSIS(possible_header, pe)
             if nsis_extracted:
-                write_multiple_files(out_path, nsis_extracted, log_message)
                 result_code = 5 # NSIS Installer
-                return result_code
+                if write_output:
+                    write_multiple_files(out_path, nsis_extracted, log_message)
+                else:
+                    log_message("Installer detected. Analysis only: "
+                                "no files were extracted.")
+                return make_result(result_code, beginning_file_size, 0, [],
+                                   write_output, write_output)
 
         log_message("Attempting dynamic trim...")
         last_section = find_last_section(pe)
         if last_section is None:
             log_message("Unable to process. This may indicate the file is malformed.")
-            return 0
+            return make_result(0, beginning_file_size, 0, [], False, False)
         overlay = memoryview(pe.__data__)[last_section.PointerToRawData + last_section.SizeOfRawData:signature_address or beginning_file_size]
         
         # The following checks a sample of the overlay to determine if it will be able to be removed.
@@ -602,7 +643,7 @@ Email: Squiblydoo@pm.me
 Twitter: @SquiblydooBlog.
                     """)
         result_code = 0
-        return result_code
+        return make_result(result_code, beginning_file_size, 0, [], False, False)
     else:
         pe_data = bytearray()
         start = 0
@@ -618,17 +659,42 @@ Twitter: @SquiblydooBlog.
                 pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].VirtualAddress = len(pe_data) - signature_size
 
         pe.__data__ = pe_data
-        final_filesize, new_pe_name = write_patched_file(out_path,
-                                                         pe)
-        reduction_calculation = round(((beginning_file_size \
-                                        - final_filesize) \
+        removed_bytes = beginning_file_size - len(pe_data)
+        removed_ranges = sorted(data_to_delete)
+        reduction_calculation = round((removed_bytes \
                                         / beginning_file_size) * 100, 2)
         log_message("Beginning File size: " \
                 + readable_size(beginning_file_size) + ".")
         log_message("File was reduced by " \
                     + str(reduction_calculation) + "%.")
+        if not write_output:
+            log_message("Analysis only: no file was written.")
+            return make_result(result_code, len(pe_data), removed_bytes,
+                               removed_ranges, False, False)
+        # Fix the header CheckSum of the trimmed file before writing.
+        pe.OPTIONAL_HEADER.CheckSum = 0
+        pe.OPTIONAL_HEADER.CheckSum = pe.generate_checksum()
+        final_filesize, new_pe_name = write_patched_file(out_path,
+                                                         pe)
+        with open(new_pe_name, "rb") as written_file:
+            output_data = written_file.read()
+        verification = verify_output(original_data, output_data)
+        if has_errors(verification):
+            os.remove(new_pe_name)
+            log_message("Verification of the written file failed. "
+                        "Deleted '" + str(new_pe_name) + "'.")
+            for issue in verification:
+                if issue.severity == "error":
+                    log_message("Verification error [" + issue.code + "]: " \
+                                + issue.message)
+            return make_result(result_code, final_filesize, removed_bytes,
+                               removed_ranges, False, False, verification)
+        for issue in verification:
+            log_message("Verification warning [" + issue.code + "]: " \
+                        + issue.message)
         log_message("Final file size: " \
                     + readable_size(final_filesize) + ".")
         log_message("Processing complete.\nFile written to '" \
                     + str(new_pe_name) + "'.")
-        return result_code
+        return make_result(result_code, final_filesize, removed_bytes,
+                           removed_ranges, True, True, verification)
